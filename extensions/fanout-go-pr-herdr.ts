@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -892,6 +892,10 @@ export default function (pi: ExtensionAPI) {
           ? `${dispatched[index]?.tabId}/${dispatched[index]?.paneId}: ${describeError(result.reason)}`
           : undefined)
         .filter((failure): failure is string => Boolean(failure));
+
+      if (failures.length === 0) {
+        await rm(promptDir, { recursive: true, force: true });
+      }
 
       if (failures.length > 0) {
         const ready = launched.map((item) => `${item.tabId}/${item.paneId}`).join(", ") || "none";

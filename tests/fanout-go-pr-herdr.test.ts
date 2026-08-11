@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -351,9 +351,9 @@ test("launch tool creates no-focus Herdr tabs and dispatches workers to returned
       result.details.launched.map((item: { worktreeRoot: string }) => item.worktreeRoot),
       ["/repo.worktree-api", "/repo.worktree-ui"],
     );
-    assert.equal(statSync(result.details.promptDir).mode & 0o777, 0o700);
+    assert.equal(existsSync(result.details.promptDir), false);
     for (const item of result.details.launched as Array<{ promptFile: string }>) {
-      assert.equal(statSync(item.promptFile).mode & 0o777, 0o600);
+      assert.equal(existsSync(item.promptFile), false);
     }
     generatedPromptDir = result.details.promptDir;
   } finally {

@@ -87,7 +87,7 @@ The review handoff is a terminating Pi tool. It starts a detached shell script t
 5. starts a fresh named Pi agent with `herdr agent start`; and
 6. verifies and prompts Pi through the exact pane ID, so a global agent-name collision cannot redirect the review.
 
-The detached process survives the old Pi process exiting. Its log is written under the system temporary directory and returned in the handoff tool result. If a handoff fails, inspect that log and recover manually in the same tab:
+The detached process survives the old Pi process exiting. Its `0600` log is written under the system temporary directory and returned in the handoff tool result. The log is intentionally retained for recovery; remove it after inspection because it can contain local operational metadata. If a handoff fails, inspect that log and recover manually in the same tab:
 
 ```text
 /pr-review-goal <pr-number> --base=<branch>
@@ -104,7 +104,9 @@ The tests cover command parsing, Herdr JSON envelopes and killed outcomes, Workt
 
 ## Notes
 
-- Fanout prompt files and review handoff logs are stored under cryptographically unique names in the system temporary directory. Prompt directories use mode `0700`; prompt/log files use `0600` and exclusive creation.
+- Fanout prompt files and review handoff logs use cryptographically unique names in the system temporary directory. Prompt directories use mode `0700`; prompt/log files use `0600` and exclusive creation.
+- Prompt directories are removed after every worker reaches verified readiness. They are retained when dispatch or readiness fails so affected tabs remain diagnosable; remove those directories manually after recovery.
+- Review handoff logs are retained for diagnostics and should be removed after successful handoff or completed recovery.
 - Successfully launched or dispatched tabs are left open on later partial/readiness failure so their agents and terminal output remain inspectable.
 - A tab created for a command that is proven not to have been dispatched is closed by the extension.
 - The extension never closes tabs or workspaces it did not create.
