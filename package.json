@@ -1,0 +1,45 @@
+{
+  "name": "pi-parallel-go-pr-herdr",
+  "version": "0.1.0",
+  "description": "Pi extension for fanning out PR-sized work into concurrent Worktrunk worktrees running in Herdr tabs.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "herdr",
+    "worktree",
+    "worktrunk",
+    "github"
+  ],
+  "author": "matifuentes2",
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matifuentes2/pi-parallel-go-pr-herdr.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/fanout-go-pr-herdr.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@types/node": "24.12.4",
+    "typebox": "1.3.7",
+    "typescript": "5.9.3"
+  }
+}
