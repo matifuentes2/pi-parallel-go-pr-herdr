@@ -12,6 +12,8 @@ const PACKAGE_NAME = "pi-parallel-go-pr-herdr";
 const DEFAULT_GO_PR_PROMPT_PATH = join(homedir(), ".pi", "agent", "prompts", "go-pr.md");
 const WORKER_START_TIMEOUT_MS = 90 * 1000;
 const HANDOFF_IDLE_TIMEOUT_MS = 5 * 60 * 1000;
+const ORCHESTRATORS = ["orca", "herdr"] as const;
+type Orchestrator = (typeof ORCHESTRATORS)[number];
 
 const PR_DESCRIPTION_QUALITY_CONTRACT = `PR description quality expectations:
 - Write the PR title and description in Spanish, while keeping technical jargon in English.
@@ -33,6 +35,7 @@ type ExecResult = {
 type FanoutOptions = {
   baseBranch: string;
   assumeYes: boolean;
+  orchestrator: Orchestrator;
   plan: string;
 };
 
@@ -76,6 +79,62 @@ type HerdrEnvelope<T> = {
   result?: T;
 };
 
+type OrcaEnvelope<T> = {
+  id?: string;
+  ok?: boolean;
+  result?: T;
+  error?: {
+    code?: string;
+    message?: string;
+  };
+};
+
+type OrcaStatusResult = {
+  runtime?: {
+    reachable?: boolean;
+    state?: string;
+  };
+};
+
+type OrcaWorktree = {
+  id?: string;
+  path?: string;
+  branch?: string;
+  git?: {
+    path?: string;
+    branch?: string;
+  };
+};
+
+type OrcaTerminal = {
+  handle?: string;
+  worktreeId?: string;
+  worktreePath?: string;
+  title?: string;
+  connected?: boolean;
+  writable?: boolean;
+  orphaned?: boolean;
+  preview?: string;
+};
+
+type OrcaTerminalShowResult = {
+  terminal?: OrcaTerminal;
+};
+
+type OrcaWorktreeCreatedResult = {
+  worktree?: OrcaWorktree;
+  worktreeId?: string;
+  worktreePath?: string;
+  branch?: string;
+  agentTerminalHandle?: string;
+  startupTerminal?: OrcaTerminal;
+  terminal?: OrcaTerminal;
+};
+
+type OrcaTerminalListResult = {
+  terminals?: OrcaTerminal[];
+};
+
 type HerdrContext = {
   paneId: string;
   tabId: string;
@@ -102,6 +161,31 @@ function slugify(value: string): string {
     .replace(/^-+|-+$/g, "")
     .slice(0, 48);
   return slug || "work";
+}
+
+function normalizeOrchestrator(value: string | undefined): Orchestrator {
+  const normalized = (value?.trim().toLowerCase() || "orca") as Orchestrator;
+  if (!ORCHESTRATORS.includes(normalized)) {
+    throw new Error(`Unsupported orchestrator: ${value}. Expected one of: ${ORCHESTRATORS.join(", ")}.`);
+  }
+  return normalized;
+}
+
+function resolveOrcaCommand(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const configured = env.ORCA_CLI_COMMAND?.trim();
+  if (configured) return configured;
+  if (env.ORCA_DEV_REPO_ROOT?.trim()) return "orca-dev";
+  const insideOrca = Boolean(
+    env.ORCA_WORKTREE_ID?.trim()
+      || env.ORCA_TERMINAL_HANDLE?.trim()
+      || env.ORCA_PANE_KEY?.trim()
+      || env.ORCA_ENVIRONMENT?.trim(),
+  );
+  if (platform === "linux" && !insideOrca) return "orca-ide";
+  return "orca";
 }
 
 function tokenizeArgs(input: string): string[] {
@@ -159,6 +243,7 @@ function parseArgs(args: string | undefined): FanoutOptions {
   const rest: string[] = [];
   let baseBranch = DEFAULT_BASE_BRANCH;
   let assumeYes = false;
+  let orchestrator: Orchestrator = "orca";
 
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index] ?? "";
@@ -181,11 +266,24 @@ function parseArgs(args: string | undefined): FanoutOptions {
       continue;
     }
 
+    if (token === "--orchestrator" || token === "-o") {
+      const next = tokens[index + 1];
+      if (!next) throw new Error("Missing value for --orchestrator.");
+      orchestrator = normalizeOrchestrator(next);
+      index += 1;
+      continue;
+    }
+
+    if (token.startsWith("--orchestrator=")) {
+      orchestrator = normalizeOrchestrator(token.slice("--orchestrator=".length));
+      continue;
+    }
+
     rest.push(token);
   }
 
   if (!baseBranch.trim()) throw new Error("Base branch cannot be empty.");
-  return { baseBranch: baseBranch.trim(), assumeYes, plan: rest.join(" ").trim() };
+  return { baseBranch: baseBranch.trim(), assumeYes, orchestrator, plan: rest.join(" ").trim() };
 }
 
 async function exec(
@@ -291,6 +389,178 @@ function parseHerdrResult<T>(result: ExecResult, operation: string): T {
 
   if (!envelope.result) throw new Error(`Herdr ${operation} response did not include a result.`);
   return envelope.result;
+}
+
+function parseOrcaResult<T>(result: ExecResult, operation: string): T {
+  throwIfKilled(result, `Orca ${operation}`);
+  const text = result.stdout?.trim() || result.stderr?.trim();
+  if (!text) {
+    if (result.code !== 0) throw new Error(`Orca ${operation} failed: ${commandFailure(result)}`);
+    throw new Error(`Orca ${operation} returned no JSON response.`);
+  }
+
+  let envelope: OrcaEnvelope<T>;
+  try {
+    envelope = JSON.parse(text) as OrcaEnvelope<T>;
+  } catch (error) {
+    if (result.code !== 0) throw new Error(`Orca ${operation} failed: ${commandFailure(result)}`);
+    throw new Error(
+      `Orca ${operation} returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (result.code !== 0 || envelope.ok === false) {
+    const reason = envelope.error?.message || envelope.error?.code || commandFailure(result);
+    throw new Error(`Orca ${operation} failed: ${reason}`);
+  }
+  if (envelope.result === undefined) throw new Error(`Orca ${operation} response did not include a result.`);
+  return envelope.result;
+}
+
+function orcaWorktreeSelector(root: string): string {
+  return `path:${root}`;
+}
+
+async function requireOrcaReady(
+  pi: ExtensionAPI,
+  orcaCommand: string,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await exec(pi, orcaCommand, ["status", "--json"], cwd, 10_000, signal);
+  const status = parseOrcaResult<OrcaStatusResult>(result, "status");
+  if (status.runtime?.reachable !== true) {
+    throw new Error(`Orca runtime is not reachable${status.runtime?.state ? ` (${status.runtime.state})` : ""}. Run ${orcaCommand} open --json and retry.`);
+  }
+}
+
+async function requireOrcaRepo(
+  pi: ExtensionAPI,
+  orcaCommand: string,
+  root: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await exec(
+    pi,
+    orcaCommand,
+    ["repo", "show", "--repo", orcaWorktreeSelector(root), "--json"],
+    root,
+    10_000,
+    signal,
+  );
+  try {
+    parseOrcaResult<Record<string, unknown>>(result, "repo show");
+  } catch (error) {
+    throw new Error(`${describeError(error)} Register the repository with ${orcaCommand} repo add --path ${shellQuote(root)} --json.`);
+  }
+}
+
+async function requireOrcaWorktree(
+  pi: ExtensionAPI,
+  orcaCommand: string,
+  root: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await exec(
+    pi,
+    orcaCommand,
+    ["worktree", "show", "--worktree", orcaWorktreeSelector(root), "--json"],
+    root,
+    10_000,
+    signal,
+  );
+  parseOrcaResult<Record<string, unknown>>(result, "worktree show");
+}
+
+function extractOrcaWorktree(result: OrcaWorktreeCreatedResult, title: string): Required<Pick<OrcaWorktree, "id" | "path">> & OrcaWorktree {
+  const id = result.worktree?.id?.trim() || result.worktreeId?.trim();
+  const path = result.worktree?.path?.trim() || result.worktree?.git?.path?.trim() || result.worktreePath?.trim();
+  if (!id || !path) {
+    throw new Error(`Orca worktree create for ${title} did not return both worktree.id and worktree.path.`);
+  }
+  return { ...result.worktree, id, path };
+}
+
+async function verifyOrcaAgentTerminal(
+  pi: ExtensionAPI,
+  orcaCommand: string,
+  handle: string,
+  worktree: OrcaWorktree & { id: string; path: string },
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await exec(
+    pi,
+    orcaCommand,
+    ["terminal", "show", "--terminal", handle, "--json"],
+    cwd,
+    10_000,
+    signal,
+  );
+  const shown = parseOrcaResult<OrcaTerminalShowResult>(result, `terminal show ${handle}`);
+  const terminal = shown.terminal;
+  if (!terminal || terminal.handle !== handle) {
+    throw new Error(`Orca terminal show did not return the expected handle ${handle}.`);
+  }
+  if (terminal.worktreeId && terminal.worktreeId !== worktree.id) {
+    throw new Error(`Orca terminal ${handle} belongs to ${terminal.worktreeId}; expected ${worktree.id}.`);
+  }
+  if (terminal.worktreePath && terminal.worktreePath !== worktree.path) {
+    throw new Error(`Orca terminal ${handle} belongs to ${terminal.worktreePath}; expected ${worktree.path}.`);
+  }
+  if (terminal.connected !== true || terminal.writable !== true || terminal.orphaned === true) {
+    throw new Error(`Pi terminal ${handle} in retained Orca worktree ${worktree.id} is not connected and writable.`);
+  }
+}
+
+async function resolveOrcaAgentTerminal(
+  pi: ExtensionAPI,
+  orcaCommand: string,
+  created: OrcaWorktreeCreatedResult,
+  worktree: OrcaWorktree & { id: string; path: string },
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const direct = created.agentTerminalHandle?.trim()
+    || created.startupTerminal?.handle?.trim()
+    || created.terminal?.handle?.trim();
+  if (direct) {
+    try {
+      await verifyOrcaAgentTerminal(pi, orcaCommand, direct, worktree, cwd, signal);
+      return direct;
+    } catch (error) {
+      if (!/terminal_handle_stale|stale terminal handle/i.test(describeError(error))) throw error;
+    }
+  }
+
+  const result = await exec(
+    pi,
+    orcaCommand,
+    ["terminal", "list", "--worktree", `id:${worktree.id}`, "--json"],
+    cwd,
+    10_000,
+    signal,
+  );
+  const listed = parseOrcaResult<OrcaTerminalListResult>(result, `terminal list for ${worktree.id}`);
+  const terminals = (listed.terminals ?? []).filter((terminal) => terminal.handle && terminal.connected !== false);
+  const piTerminals = terminals.filter((terminal) => /\bpi\b/i.test(`${terminal.title ?? ""} ${terminal.preview ?? ""}`));
+  const candidates = piTerminals.length > 0 ? piTerminals : terminals;
+  if (candidates.length !== 1 || !candidates[0]?.handle) {
+    const handles = candidates.map((terminal) => terminal.handle).filter(Boolean).join(", ") || "none";
+    throw new Error(`Could not identify one Pi terminal for retained Orca worktree ${worktree.id}; candidates: ${handles}.`);
+  }
+  await verifyOrcaAgentTerminal(pi, orcaCommand, candidates[0].handle, worktree, cwd, signal);
+  return candidates[0].handle;
+}
+
+function describeOrcaLaunchFailure(
+  error: unknown,
+  launchedWorktreeIds: string[],
+  currentBranch: string | undefined,
+): string {
+  const known = launchedWorktreeIds.join(", ") || "none identified";
+  const current = currentBranch ? ` for branch ${currentBranch}` : "";
+  return `${describeError(error)} Known retained Orca worktrees: ${known}. The last Orca create or verification${current} may have completed despite the error; inspect Orca before retrying.`;
 }
 
 async function currentHerdrContext(
@@ -414,6 +684,30 @@ async function waitForHerdrPiAgent(
   );
 }
 
+async function verifyWorkerCheckoutPath(
+  pi: ExtensionAPI,
+  checkoutPath: string,
+  expectedBranch: string,
+  sourceRoot: string,
+  owner: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const worktreeRoot = await repoRoot(pi, checkoutPath, signal);
+  if (!worktreeRoot) throw new Error(`${owner} is not running inside a git worktree: ${checkoutPath}.`);
+  if (worktreeRoot === sourceRoot) {
+    throw new Error(`${owner} started in the source checkout instead of an isolated worktree: ${sourceRoot}.`);
+  }
+
+  const branchResult = await exec(pi, "git", ["branch", "--show-current"], worktreeRoot, 10_000, signal);
+  throwIfKilled(branchResult, `Verifying branch in ${worktreeRoot}`);
+  const actualBranch = branchResult.stdout?.trim();
+  if (branchResult.code !== 0 || actualBranch !== expectedBranch) {
+    throw new Error(`${owner} started on ${actualBranch || "an unknown branch"}; expected ${expectedBranch}.`);
+  }
+
+  return worktreeRoot;
+}
+
 async function verifyWorkerCheckout(
   pi: ExtensionAPI,
   agent: HerdrAgent,
@@ -423,23 +717,14 @@ async function verifyWorkerCheckout(
 ): Promise<string> {
   const foregroundCwd = agent.foreground_cwd?.trim();
   if (!foregroundCwd) throw new Error(`Herdr did not report a foreground cwd for Pi in ${agent.pane_id}.`);
-
-  const worktreeRoot = await repoRoot(pi, foregroundCwd, signal);
-  if (!worktreeRoot) throw new Error(`Pi in ${agent.pane_id} is not running inside a git worktree: ${foregroundCwd}.`);
-  if (worktreeRoot === sourceRoot) {
-    throw new Error(`Pi in ${agent.pane_id} started in the source checkout instead of an isolated worktree: ${sourceRoot}.`);
-  }
-
-  const branchResult = await exec(pi, "git", ["branch", "--show-current"], worktreeRoot, 10_000, signal);
-  throwIfKilled(branchResult, `Verifying branch in ${worktreeRoot}`);
-  const actualBranch = branchResult.stdout?.trim();
-  if (branchResult.code !== 0 || actualBranch !== expectedBranch) {
-    throw new Error(
-      `Pi in ${agent.pane_id} started on ${actualBranch || "an unknown branch"}; expected ${expectedBranch}.`,
-    );
-  }
-
-  return worktreeRoot;
+  return verifyWorkerCheckoutPath(
+    pi,
+    foregroundCwd,
+    expectedBranch,
+    sourceRoot,
+    `Pi in ${agent.pane_id}`,
+    signal,
+  );
 }
 
 function buildPrReviewCommand(prNumber: number, baseBranch?: string): string {
@@ -451,17 +736,27 @@ function buildWorkerPrompt(input: {
   plan: string;
   baseBranch: string;
   repoRoot: string;
+  orchestrator?: Orchestrator;
 }): string {
-  return `You are one independent coding agent in a concurrent multi-worktree fanout running in a dedicated Herdr tab.
+  const orchestrator = input.orchestrator ?? "orca";
+  const location = orchestrator === "orca"
+    ? "a dedicated Orca worktree and terminal"
+    : "a dedicated Herdr tab and Worktrunk worktree";
+  const handoff = orchestrator === "orca"
+    ? "renames this Orca worktree to the PR number, waits for this Pi process to exit, starts a fresh named Pi agent in a new terminal in the same worktree, and submits the review command"
+    : "renames this exact Herdr tab to the PR number, waits for this turn to settle, exits this Pi process, starts a fresh named Pi agent in the same pane and worktree, and submits the review command";
+
+  return `You are one independent coding agent in a concurrent multi-worktree fanout running in ${location}.
 
 Repository root that launched this job: ${input.repoRoot}
 Base branch used to create this worktree: ${input.baseBranch}
+Fanout orchestrator: ${orchestrator}
 Work item title: ${input.title}
 
 Scope contract:
 - Implement ONLY this work item. Do not opportunistically implement sibling phases or unrelated cleanup.
 - Preserve the existing repo instructions and AGENTS.md constraints.
-- If this work item is blocked or overlaps another launched work item in a way that makes a clean independent PR impossible, stop and ask for human guidance in this Herdr tab.
+- If this work item is blocked or overlaps another launched work item in a way that makes a clean independent PR impossible, stop and ask for human guidance in this worker terminal.
 - Prefer the smallest coherent PR that satisfies this item.
 
 Work item plan:
@@ -479,20 +774,26 @@ If the slash prompt is unavailable in this startup context, follow these instruc
 <<GO_PR_PROMPT_PLACEHOLDER>>
 --- end /go-pr contract ---
 
-Once the PR exists and you know its PR number, call fanout_go_pr_review_handoff as your final action with that PR number, this work item title, and baseBranch ${input.baseBranch}. That terminating tool renames this exact Herdr tab to the PR number, waits for this turn to settle, exits this Pi process, starts a fresh named Pi agent in the same pane and worktree, and submits /pr-review-goal with the same target branch. If the tool is unavailable, clearly report the PR number and ask the user to run /pr-review-goal <pr-number> --base=${input.baseBranch} manually.`;
+Once the PR exists and you know its PR number, call fanout_go_pr_review_handoff as your final action with that PR number, this work item title, baseBranch ${input.baseBranch}, and orchestrator ${orchestrator}. That terminating tool ${handoff} /pr-review-goal with the same target branch. If the tool is unavailable, clearly report the PR number and ask the user to run /pr-review-goal <pr-number> --base=${input.baseBranch} manually.`;
 }
 
 function buildDecompositionPrompt(input: {
   baseBranch: string;
   assumeYes: boolean;
   repoRoot: string;
+  orchestrator?: Orchestrator;
   plan?: string;
 }): string {
+  const orchestrator = input.orchestrator ?? "orca";
   const planSource = input.plan?.trim()
     ? `Original plan provided to /fanout-go-pr:\n${input.plan.trim()}`
     : "No explicit plan text was passed to /fanout-go-pr. Infer the implementation plan from the preceding conversation context, including the user's latest requests, any active plan/handoff already discussed, and relevant assistant decisions. If the conversation context does not contain a concrete implementation plan, ask follow-up questions and DO NOT launch tools yet.";
+  const launchSurface = orchestrator === "orca"
+    ? "Launch every worker as a background Orca worktree with its Pi agent in the first terminal; do not pass --activate or steal focus."
+    : "Launch every worker as a background Herdr tab in the current workspace and do not steal focus.";
+  const extraCost = orchestrator === "orca" ? "Orca worktree and terminal" : "worktree and Herdr tab";
 
-  return `Turn the implementation plan into the fewest coherent PR-sized pieces that preserve meaningful parallel execution. Start from one PR; create an additional piece only when it has a clear, material concurrency benefit that outweighs its extra CI run, review cycle, worktree, Herdr tab, and agent-token cost.
+  return `Turn the implementation plan into the fewest coherent PR-sized pieces that preserve meaningful parallel execution. Start from one PR; create an additional piece only when it has a clear, material concurrency benefit that outweighs its extra CI run, review cycle, ${extraCost}, and agent-token cost.
 
 Rules:
 - Prefer true independence: no piece should require another launched piece to merge first.
@@ -505,12 +806,14 @@ Rules:
 - Before launching, briefly state why each additional PR is worth its separate CI run and review cycle. If there is no strong reason, merge it into the nearest coherent piece.
 - Use base/PR target branch: ${input.baseBranch}.
 - Repository root: ${input.repoRoot}.
-- Launch every worker as a background Herdr tab in the current workspace and do not steal focus.
+- Selected orchestrator: ${orchestrator}.
+- ${launchSurface}
 - ${input.assumeYes ? "The user passed --yes; if the split is clear, launch without asking for additional confirmation." : "Before launching, briefly present the proposed pieces. If they are clear and low-risk, proceed; otherwise ask for confirmation/follow-up."}
 
 When you are ready to launch, call fanout_go_pr_launch exactly once with:
 - repoRoot: ${input.repoRoot}
 - baseBranch: ${input.baseBranch}
+- orchestrator: ${orchestrator}
 - pieces: an array of { title, branchName, plan }
 
 Branch naming:
@@ -556,6 +859,7 @@ function preparePieces(input: {
   pieces: Array<{ title: string; branchName?: string; plan: string }>;
   baseBranch: string;
   repoRoot: string;
+  orchestrator?: Orchestrator;
   runId: string;
   promptDir: string;
   goPrPrompt: string;
@@ -581,6 +885,7 @@ function preparePieces(input: {
       plan,
       baseBranch: input.baseBranch,
       repoRoot: input.repoRoot,
+      orchestrator: input.orchestrator,
     }).replace("<<GO_PR_PROMPT_PLACEHOLDER>>", input.goPrPrompt);
 
     return { title, branchName, tabLabel, sessionName, promptFile, workerPrompt };
@@ -599,6 +904,32 @@ function buildWorkerCommand(input: {
     `cd ${shellQuote(input.repoRoot)}`,
     `wt switch --create ${shellQuote(input.branchName)} --base ${shellQuote(input.baseBranch)} --yes -x ${shellQuote(`pi --name ${shellQuote(input.sessionName)}`)} -- ${shellQuote(`@${input.promptFile}`)} ${shellQuote("Execute the attached independent work item instructions.")}`,
   ].join("; ");
+}
+
+function buildOrcaWorkerArgs(input: {
+  repoRoot: string;
+  branchName: string;
+  baseBranch: string;
+  workerPrompt: string;
+}): string[] {
+  return [
+    "worktree",
+    "create",
+    "--repo",
+    orcaWorktreeSelector(input.repoRoot),
+    "--name",
+    input.branchName,
+    "--base-branch",
+    input.baseBranch,
+    "--no-parent",
+    "--setup",
+    "run",
+    "--agent",
+    "pi",
+    "--prompt",
+    input.workerPrompt,
+    "--json",
+  ];
 }
 
 function createReviewAgentName(prNumber: number, entropy = randomUUID()): string {
@@ -681,6 +1012,110 @@ echo "Review handoff submitted."
 `;
 }
 
+function buildOrcaReviewHandoffScript(input: {
+  orcaPath: string;
+  piPath: string;
+  parentPid: number;
+  repoRoot: string;
+  agentName: string;
+  sessionName: string;
+  reviewCommand: string;
+  idleTimeoutMs?: number;
+}): string {
+  const timeout = input.idleTimeoutMs ?? HANDOFF_IDLE_TIMEOUT_MS;
+  const title = `Review ${input.agentName}`;
+  const piCommand = `${shellQuote(input.piPath)} --name ${shellQuote(input.sessionName)}`;
+
+  return `import { spawnSync } from "node:child_process";
+import { unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const ORCA = ${JSON.stringify(input.orcaPath)};
+const PARENT_PID = ${input.parentPid};
+const WORKTREE = ${JSON.stringify(orcaWorktreeSelector(input.repoRoot))};
+const TITLE = ${JSON.stringify(title)};
+const AGENT_COMMAND = ${JSON.stringify(piCommand)};
+const REVIEW_COMMAND = ${JSON.stringify(input.reviewCommand)};
+const EXIT_TIMEOUT_MS = ${timeout};
+const SELF = fileURLToPath(import.meta.url);
+const sleepBuffer = new Int32Array(new SharedArrayBuffer(4));
+
+function sleep(ms) {
+  Atomics.wait(sleepBuffer, 0, 0, ms);
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error && error.code === "EPERM";
+  }
+}
+
+function runOrca(args, timeout = 90000) {
+  const completed = spawnSync(ORCA, args, { encoding: "utf8", timeout });
+  if (completed.error) throw completed.error;
+  const text = String(completed.stdout || completed.stderr || "").trim();
+  let envelope;
+  try {
+    envelope = JSON.parse(text);
+  } catch (error) {
+    throw new Error("Orca returned invalid JSON for " + args.slice(0, 2).join(" ") + ": " + (error instanceof Error ? error.message : String(error)));
+  }
+  if (completed.status !== 0 || envelope.ok === false) {
+    const reason = envelope.error?.message || envelope.error?.code || text || ("exit code " + completed.status);
+    throw new Error("Orca " + args.slice(0, 2).join(" ") + " failed: " + reason);
+  }
+  if (!("result" in envelope)) throw new Error("Orca response did not include a result.");
+  return envelope.result;
+}
+
+try {
+  console.log("Waiting for fanout worker process " + PARENT_PID + " to exit...");
+  const deadline = Date.now() + EXIT_TIMEOUT_MS;
+  while (processIsAlive(PARENT_PID) && Date.now() < deadline) sleep(500);
+  if (processIsAlive(PARENT_PID)) throw new Error("Timed out waiting for the previous Pi process to exit.");
+
+  const created = runOrca(["terminal", "create", "--worktree", WORKTREE, "--title", TITLE, "--command", AGENT_COMMAND, "--json"]);
+  let handle = created.terminal?.handle || created.handle || created.terminalHandle || created.startupTerminal?.handle;
+  if (!handle) {
+    const listed = runOrca(["terminal", "list", "--worktree", WORKTREE, "--json"]);
+    const matching = (listed.terminals || []).filter((terminal) => terminal?.handle && terminal.title === TITLE);
+    if (matching.length !== 1) throw new Error("Could not identify the fresh Orca review terminal.");
+    handle = matching[0].handle;
+  }
+
+  runOrca(["terminal", "wait", "--terminal", handle, "--for", "tui-idle", "--timeout-ms", "60000", "--json"], 70000);
+  runOrca(["terminal", "send", "--terminal", handle, "--text", REVIEW_COMMAND, "--enter", "--json"]);
+  console.log("Review handoff submitted to Orca terminal " + handle + ".");
+} catch (error) {
+  console.error(error instanceof Error ? error.stack || error.message : String(error));
+  process.exitCode = 1;
+} finally {
+  try { unlinkSync(SELF); } catch {}
+}
+`;
+}
+
+function spawnDetachedOrcaHandoff(scriptPath: string, logPath: string, cwd: string): number {
+  const logFd = openSync(logPath, "ax", 0o600);
+  try {
+    const child = spawn(process.execPath, [scriptPath], {
+      cwd,
+      detached: true,
+      env: { ...process.env },
+      stdio: ["ignore", logFd, logFd],
+    });
+    child.on("error", () => undefined);
+    child.unref();
+    if (!child.pid) throw new Error("Detached Orca handoff process did not start.");
+    return child.pid;
+  } finally {
+    closeSync(logFd);
+  }
+}
+
 function spawnDetachedHandoff(scriptPath: string, logPath: string, cwd: string): number {
   const logFd = openSync(logPath, "ax", 0o600);
   try {
@@ -705,7 +1140,7 @@ function describeError(error: unknown): string {
 
 export default function (pi: ExtensionAPI) {
   pi.registerCommand("fanout-go-pr", {
-    description: "Consolidate a plan into the fewest useful concurrent wt/Herdr PR agents, then launch same-tab review handoffs (-b <branch> to set the base branch)",
+    description: "Consolidate a plan into concurrent PR agents using Orca (default) or Herdr (--orchestrator <orca|herdr>, -b <branch>)",
     handler: async (args, ctx) => {
       let parsed: FanoutOptions;
       try {
@@ -722,11 +1157,21 @@ export default function (pi: ExtensionAPI) {
       }
 
       try {
-        for (const binary of ["herdr", "wt", "pi"]) {
-          const found = await requireCommand(pi, binary, root);
-          if (!found) throw new Error(`Required command not found in PATH: ${binary}`);
+        if (parsed.orchestrator === "orca") {
+          const orcaCommand = resolveOrcaCommand();
+          for (const binary of [orcaCommand, "pi"]) {
+            const found = await requireCommand(pi, binary, root);
+            if (!found) throw new Error(`Required command not found in PATH: ${binary}`);
+          }
+          await requireOrcaReady(pi, orcaCommand, root);
+          await requireOrcaRepo(pi, orcaCommand, root);
+        } else {
+          for (const binary of ["herdr", "wt", "pi"]) {
+            const found = await requireCommand(pi, binary, root);
+            if (!found) throw new Error(`Required command not found in PATH: ${binary}`);
+          }
+          await currentHerdrContext(pi, root);
         }
-        await currentHerdrContext(pi, root);
         await validateBranch(pi, parsed.baseBranch, root, "base branch");
         await requireGitRef(pi, parsed.baseBranch, root);
       } catch (error) {
@@ -739,6 +1184,7 @@ export default function (pi: ExtensionAPI) {
         baseBranch: parsed.baseBranch,
         assumeYes: parsed.assumeYes,
         repoRoot: root,
+        orchestrator: parsed.orchestrator,
         plan: plan || undefined,
       }));
     },
@@ -746,15 +1192,16 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "fanout_go_pr_launch",
-    label: "Launch fanout PR agents in Herdr",
-    description: "Create background Herdr tabs in the current workspace, use wt to create one git worktree per tab, and start independent Pi agents for PR-sized work items. The tool preserves focus and returns exact Herdr workspace, tab, and pane IDs.",
-    promptSnippet: "Launch independent Herdr-tab/wt/Pi agents for a decomposed PR fanout plan.",
+    label: "Launch fanout PR agents",
+    description: "Create one isolated worktree and Pi worker per PR-sized item using Orca (default) or Herdr. Orca launches stay in background; Herdr launches preserve exact workspace, tab, and pane targeting.",
+    promptSnippet: "Launch independent worktree-backed Pi agents for a decomposed PR fanout plan using Orca or Herdr.",
     promptGuidelines: [
-      "Use fanout_go_pr_launch only after /fanout-go-pr has produced a clear independent split; ask follow-up questions instead of launching ambiguous or dependent pieces.",
+      "Use fanout_go_pr_launch only after /fanout-go-pr has produced a clear independent split; pass its selected orchestrator and ask follow-up questions instead of launching ambiguous or dependent pieces.",
     ],
     parameters: Type.Object({
       repoRoot: Type.String({ minLength: 1, description: "Git repository root from which /fanout-go-pr was called." }),
-      baseBranch: Type.Optional(Type.String({ minLength: 1, description: "Base branch for wt switch --create and target branch for the downstream PR/review. Defaults to develop." })),
+      baseBranch: Type.Optional(Type.String({ minLength: 1, description: "Base branch for the new worktree and target branch for the downstream PR/review. Defaults to develop." })),
+      orchestrator: Type.Optional(Type.String({ enum: [...ORCHESTRATORS], description: "Agent orchestrator. Defaults to orca." })),
       pieces: Type.Array(Type.Object({
         title: Type.String({ minLength: 1, description: "Short human-readable work item title." }),
         branchName: Type.Optional(Type.String({ minLength: 1, description: "Unique branch name, preferably agent/<slug>." })),
@@ -765,12 +1212,25 @@ export default function (pi: ExtensionAPI) {
       const root = await repoRoot(pi, params.repoRoot || ctx.cwd, signal);
       if (!root) throw new Error("fanout_go_pr_launch must run inside a git repository.");
 
-      for (const binary of ["herdr", "wt", "pi"]) {
-        const found = await requireCommand(pi, binary, root, signal);
-        if (!found) throw new Error(`Required command not found in PATH: ${binary}`);
+      const orchestrator = normalizeOrchestrator(params.orchestrator);
+      let herdr: HerdrContext | undefined;
+      let orcaCommand: string | undefined;
+      if (orchestrator === "orca") {
+        orcaCommand = resolveOrcaCommand();
+        for (const binary of [orcaCommand, "pi"]) {
+          const found = await requireCommand(pi, binary, root, signal);
+          if (!found) throw new Error(`Required command not found in PATH: ${binary}`);
+        }
+        await requireOrcaReady(pi, orcaCommand, root, signal);
+        await requireOrcaRepo(pi, orcaCommand, root, signal);
+      } else {
+        for (const binary of ["herdr", "wt", "pi"]) {
+          const found = await requireCommand(pi, binary, root, signal);
+          if (!found) throw new Error(`Required command not found in PATH: ${binary}`);
+        }
+        herdr = await currentHerdrContext(pi, root, signal);
       }
 
-      const herdr = await currentHerdrContext(pi, root, signal);
       const baseBranch = params.baseBranch?.trim() || DEFAULT_BASE_BRANCH;
       await validateBranch(pi, baseBranch, root, "base branch", signal);
       await requireGitRef(pi, baseBranch, root, signal);
@@ -784,6 +1244,7 @@ export default function (pi: ExtensionAPI) {
         pieces: params.pieces,
         baseBranch,
         repoRoot: root,
+        orchestrator,
         runId,
         promptDir,
         goPrPrompt,
@@ -795,6 +1256,93 @@ export default function (pi: ExtensionAPI) {
         await writeFile(piece.promptFile, piece.workerPrompt, { encoding: "utf8", mode: 0o600, flag: "wx" });
       }
 
+      if (orchestrator === "orca") {
+        const launched: Array<{
+          title: string;
+          branchName: string;
+          worktreeId: string;
+          worktreeRoot: string;
+          terminalHandle?: string;
+          promptFile: string;
+        }> = [];
+
+        let currentBranch: string | undefined;
+        try {
+          for (const piece of prepared) {
+            currentBranch = piece.branchName;
+            throwIfAborted(signal, `Creating Orca worktree for ${piece.title}`);
+            onUpdate?.({
+              content: [{ type: "text", text: `Dispatching ${piece.title} in a background Orca worktree...` }],
+              details: { title: piece.title, branchName: piece.branchName, orchestrator },
+            });
+
+            const createResult = await exec(
+              pi,
+              orcaCommand!,
+              buildOrcaWorkerArgs({
+                repoRoot: root,
+                branchName: piece.branchName,
+                baseBranch,
+                workerPrompt: piece.workerPrompt,
+              }),
+              root,
+              WORKER_START_TIMEOUT_MS,
+              signal,
+            );
+            const created = parseOrcaResult<OrcaWorktreeCreatedResult>(createResult, `worktree create for ${piece.title}`);
+            const worktree = extractOrcaWorktree(created, piece.title);
+            const item = {
+              title: piece.title,
+              branchName: piece.branchName,
+              worktreeId: worktree.id,
+              worktreeRoot: worktree.path,
+              terminalHandle: undefined as string | undefined,
+              promptFile: piece.promptFile,
+            };
+            launched.push(item);
+            item.terminalHandle = await resolveOrcaAgentTerminal(
+              pi,
+              orcaCommand!,
+              created,
+              worktree,
+              root,
+              signal,
+            );
+            item.worktreeRoot = await verifyWorkerCheckoutPath(
+              pi,
+              worktree.path,
+              piece.branchName,
+              root,
+              `Pi in Orca worktree ${worktree.id}`,
+              signal,
+            );
+            currentBranch = undefined;
+          }
+        } catch (error) {
+          throw new Error(describeOrcaLaunchFailure(
+            error,
+            launched.map((item) => item.worktreeId),
+            currentBranch,
+          ));
+        }
+
+        await rm(promptDir, { recursive: true, force: true });
+        const summary = launched
+          .map((item) => `- ${item.worktreeId} / ${item.terminalHandle}: ${item.branchName} (${item.title})`)
+          .join("\n");
+        return {
+          content: [{ type: "text", text: `Launched and verified ${launched.length} background Orca worktree(s) and connected Pi terminal(s):\n${summary}` }],
+          details: {
+            launched,
+            orchestrator,
+            baseBranch,
+            repoRoot: root,
+            promptDir,
+          },
+        };
+      }
+
+      if (!herdr) throw new Error("Herdr context was not initialized.");
       const dispatched: Array<{
         title: string;
         branchName: string;
@@ -911,6 +1459,7 @@ export default function (pi: ExtensionAPI) {
         content: [{ type: "text", text: `Launched and verified ${launched.length} fanout PR agent(s) as background Herdr tabs in ${herdr.workspaceId}:\n${summary}` }],
         details: {
           launched,
+          orchestrator,
           baseBranch,
           repoRoot: root,
           promptDir,
@@ -924,14 +1473,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerTool({
     name: "fanout_go_pr_review_handoff",
-    label: "Start fresh PR review in this Herdr tab",
-    description: "As the worker's final action, rename the exact current Herdr tab to the PR number and queue a detached same-pane handoff. The handoff waits for the worker to settle, exits it, restores the worktree cwd, starts a fresh named Pi agent through Herdr, and submits /pr-review-goal with the expected target branch.",
-    promptSnippet: "Rename this Herdr tab to the PR number and hand it to a clean same-pane PR review agent.",
+    label: "Start fresh PR review agent",
+    description: "As a fanout worker's final action, queue a detached fresh Pi review agent in the same worktree. Orca uses a new terminal; Herdr preserves its exact same-pane handoff.",
+    promptSnippet: "Hand a completed fanout PR to a clean review agent in the same worktree using Orca or Herdr.",
     promptGuidelines: [
-      "Use fanout_go_pr_review_handoff only as the final action after a fanout worker has created a PR and knows its PR number; pass the worker's baseBranch so /pr-review-goal verifies the intended target.",
-      "Do not call other tools alongside fanout_go_pr_review_handoff; it is terminating so the Herdr handoff can wait for the worker to settle safely.",
+      "Use fanout_go_pr_review_handoff only as the final action after a fanout worker has created a PR and knows its PR number; pass the worker's baseBranch and orchestrator so /pr-review-goal verifies the intended target.",
+      "Do not call other tools alongside fanout_go_pr_review_handoff; it is terminating so the selected orchestrator can replace the worker safely.",
     ],
     parameters: Type.Object({
+      orchestrator: Type.Optional(Type.String({ enum: [...ORCHESTRATORS], description: "Agent orchestrator. Defaults to orca." })),
       prNumber: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "GitHub PR number to review." }),
       title: Type.Optional(Type.String({ description: "Work item title, retained only as handoff metadata." })),
       repoRoot: Type.Optional(Type.String({ description: "Repo/worktree root. Defaults to current cwd." })),
@@ -946,8 +1496,7 @@ export default function (pi: ExtensionAPI) {
       const root = await repoRoot(pi, params.repoRoot || ctx.cwd, signal);
       if (!root) throw new Error("fanout_go_pr_review_handoff must run inside a git repository.");
 
-      const herdrPath = await requireCommand(pi, "herdr", root, signal);
-      if (!herdrPath) throw new Error("Required command not found in PATH: herdr");
+      const orchestrator = normalizeOrchestrator(params.orchestrator);
       const piPath = await requireCommand(pi, "pi", root, signal);
       if (!piPath) throw new Error("Required command not found in PATH: pi");
 
@@ -956,6 +1505,76 @@ export default function (pi: ExtensionAPI) {
       await validateBranch(pi, baseBranch, root, "target branch", signal);
       await requireGitRef(pi, baseBranch, root, signal);
 
+      if (orchestrator === "orca") {
+        const orcaCommand = resolveOrcaCommand();
+        const orcaPath = await requireCommand(pi, orcaCommand, root, signal);
+        if (!orcaPath) throw new Error(`Required command not found in PATH: ${orcaCommand}`);
+        await requireOrcaReady(pi, orcaPath, root, signal);
+        await requireOrcaWorktree(pi, orcaPath, root, signal);
+        throwIfAborted(signal, "PR review handoff");
+
+        const worktreeSelector = orcaWorktreeSelector(root);
+        const renameResult = await exec(
+          pi,
+          orcaPath,
+          ["worktree", "set", "--worktree", worktreeSelector, "--display-name", String(prNumber), "--json"],
+          root,
+          10_000,
+          signal,
+        );
+        parseOrcaResult<Record<string, unknown>>(renameResult, `worktree rename to ${prNumber}`);
+
+        const sessionName = `pr-review-${prNumber}`;
+        const agentName = createReviewAgentName(prNumber);
+        const reviewCommand = buildPrReviewCommand(prNumber, baseBranch);
+        const handoffId = `${Date.now()}-${prNumber}-${randomUUID().slice(0, 8)}`;
+        const scriptPath = join(tmpdir(), `${PACKAGE_NAME}-orca-review-handoff-${handoffId}.mjs`);
+        const logPath = join(tmpdir(), `${PACKAGE_NAME}-orca-review-handoff-${handoffId}.log`);
+        const script = buildOrcaReviewHandoffScript({
+          orcaPath,
+          piPath,
+          parentPid: process.pid,
+          repoRoot: root,
+          agentName,
+          sessionName,
+          reviewCommand,
+        });
+        await writeFile(scriptPath, script, { encoding: "utf8", mode: 0o700, flag: "wx" });
+
+        let handoffPid: number;
+        try {
+          handoffPid = spawnDetachedOrcaHandoff(scriptPath, logPath, root);
+        } catch (error) {
+          await unlink(scriptPath).catch(() => undefined);
+          throw error;
+        }
+
+        ctx.shutdown();
+        return {
+          content: [{
+            type: "text",
+            text: `Renamed Orca worktree ${worktreeSelector} to ${prNumber}. Queued detached handoff PID ${handoffPid}: after this Pi process exits, it will start ${agentName} in a fresh terminal in the same worktree and submit ${reviewCommand}. Log: ${logPath}`,
+          }],
+          details: {
+            orchestrator,
+            prNumber,
+            baseBranch,
+            worktreeSelector,
+            scriptPath,
+            logPath,
+            handoffPid,
+            agentName,
+            sessionName,
+            reviewCommand,
+            repoRoot: root,
+            title: params.title,
+          },
+          terminate: true,
+        };
+      }
+
+      const herdrPath = await requireCommand(pi, "herdr", root, signal);
+      if (!herdrPath) throw new Error("Required command not found in PATH: herdr");
       const herdr = await currentHerdrContext(pi, root, signal);
       throwIfAborted(signal, "PR review handoff");
       const tabLabel = String(prNumber);
@@ -995,6 +1614,7 @@ export default function (pi: ExtensionAPI) {
           text: `Renamed Herdr tab ${herdr.tabId} to ${prNumber}. Queued detached handoff PID ${handoffPid}: after this terminating tool settles, it will replace the agent in ${herdr.paneId} with ${agentName} and submit ${reviewCommand}. Log: ${logPath}`,
         }],
         details: {
+          orchestrator,
           prNumber,
           baseBranch,
           tabLabel,
@@ -1018,6 +1638,9 @@ export default function (pi: ExtensionAPI) {
 
 export const __testing = {
   buildDecompositionPrompt,
+  buildOrcaReviewHandoffScript,
+  describeOrcaLaunchFailure,
+  buildOrcaWorkerArgs,
   buildPrReviewCommand,
   buildReviewHandoffScript,
   buildWorkerCommand,
@@ -1026,11 +1649,15 @@ export const __testing = {
   createReviewAgentName,
   createRunId,
   normalizeBranchName,
+  normalizeOrchestrator,
   parseArgs,
   parseHerdrResult,
+  parseOrcaResult,
   preparePieces,
+  resolveOrcaCommand,
   shellQuote,
   slugify,
   verifyWorkerCheckout,
+  verifyWorkerCheckoutPath,
   waitForHerdrPiAgent,
 };

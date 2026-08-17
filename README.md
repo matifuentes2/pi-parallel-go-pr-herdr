@@ -1,37 +1,102 @@
 # pi-parallel-go-pr-herdr
 
-A personal [Pi coding agent](https://github.com/earendil-works/pi) package that fans a large implementation plan into independent, worktree-backed PR agents running in background [Herdr](https://herdr.dev) tabs.
+A personal [Pi coding agent](https://github.com/earendil-works/pi) package that fans a large implementation plan into independent, worktree-backed PR agents.
 
-It is inspired by [`matifuentes2/pi-parallel-go-pr`](https://github.com/matifuentes2/pi-parallel-go-pr), but replaces tmux windows and tmux-driven review respawns with explicit Herdr workspace/tab/pane targeting and Herdr's agent lifecycle commands.
+The package now supports two orchestrators:
+
+- **Orca** — the default. Orca creates each worktree and launches Pi in its first terminal.
+- **Herdr** — the original implementation. Worktrunk creates each worktree inside an explicitly targeted background Herdr tab.
+
+It extends [`matifuentes2/pi-parallel-go-pr`](https://github.com/matifuentes2/pi-parallel-go-pr) without reintroducing tmux.
 
 ## What it does
 
 ```text
-/fanout-go-pr [--base <branch>] [--yes] [plan text...]
+/fanout-go-pr [--orchestrator <orca|herdr>] [--base <branch>] [--yes] [plan text...]
 ```
 
-The default base branch is `develop`.
+Defaults:
+
+- orchestrator: `orca`
+- base branch: `develop`
+
+The flow is:
 
 1. Pi decomposes the plan into the fewest independently shippable PR-sized pieces.
-2. `fanout_go_pr_launch` creates one **background Herdr tab** per piece in the caller's current workspace (`--no-focus`).
-3. Each tab runs `wt switch --create` to create an isolated worktree and starts a named Pi worker with its scoped prompt. The launch tool reports success only after Herdr detects Pi in the exact returned pane and Git confirms that pane is on the expected branch in a separate worktree.
-4. After opening its PR, the worker calls `fanout_go_pr_review_handoff` as its final action.
-5. The handoff renames that exact Herdr tab to the PR number, waits for the worker to settle, exits it, restores the worktree cwd, starts a fresh Pi agent in the same pane, and submits `/pr-review-goal <number> --base=<branch>`.
+2. `fanout_go_pr_launch` creates one isolated worktree and Pi worker per piece using the selected orchestrator.
+3. The launch tool verifies that every worker is in a separate worktree on its expected branch.
+4. After opening its PR, each worker calls `fanout_go_pr_review_handoff` with the same orchestrator.
+5. A fresh Pi agent starts in the same worktree and receives `/pr-review-goal <number> --base=<branch>`.
 
-Herdr IDs returned by the CLI are parsed from JSON. The extension never guesses a focused tab or pane, and background launches do not steal focus.
+### Orca launch behavior
+
+The Orca path uses agent-first worktree creation:
+
+```text
+orca worktree create \
+  --repo path:<repo-root> \
+  --name <agent/branch> \
+  --base-branch <base> \
+  --no-parent \
+  --setup run \
+  --agent pi \
+  --prompt <worker-prompt> \
+  --json
+```
+
+It forces configured repository setup hooks with `--setup run` and deliberately omits `--activate`, so workers remain in the background and do not steal focus. It uses the exact worktree ID, path, and terminal handle returned by Orca, verifies that the terminal is connected and writable, and lets older runtimes fall back to an unambiguous terminal lookup.
+
+For review, the terminating handoff renames the Orca worktree to the PR number, requests a graceful shutdown of the worker Pi process, and starts a detached handoff. After the old process exits, the handoff creates a fresh Pi terminal in the same worktree, waits for TUI readiness, and submits `/pr-review-goal`.
+
+### Herdr launch behavior
+
+The Herdr path preserves the original safety properties:
+
+1. create one background tab in the caller's current workspace with `--no-focus`;
+2. run `wt switch --create` in the exact returned root pane;
+3. wait until Herdr detects Pi in that pane;
+4. verify the pane's worktree and branch; and
+5. perform the review handoff in that exact pane.
+
+The extension never guesses a focused Herdr tab or pane.
 
 ## Requirements
 
+All modes require:
+
 - Pi `0.84.1` or newer
-- Herdr `0.8.0` or newer
-- The parent Pi session must be running inside Herdr (`HERDR_ENV=1`)
-- The Herdr Pi integration is strongly recommended (`herdr integration install pi`) so lifecycle state is authoritative; Herdr's screen-detection fallback may work but is less reliable for the review handoff
-- [`wt`](https://worktrunk.dev) (Worktrunk CLI)
 - `git`
 - `gh` for the downstream `/go-pr` and `/pr-review-goal` flows
-- The `/go-pr` prompt and `/pr-review-goal` extension available to every spawned Pi session. The extension fails closed if it cannot read `/go-pr`; set `PI_GO_PR_PROMPT_PATH` for a nonstandard prompt location
+- The `/go-pr` prompt and `/pr-review-goal` extension available to every spawned Pi session
+- Pi available as `pi` in `PATH`
 
-Check the local setup:
+The extension fails closed if it cannot read `/go-pr`. Set `PI_GO_PR_PROMPT_PATH` for a nonstandard prompt location.
+
+### Orca mode
+
+- A running Orca app and its current CLI
+- The repository registered with Orca
+- The `pi` TUI agent available to Orca
+
+Check the setup:
+
+```bash
+orca status --json
+orca repo list --json
+orca repo add --path "$(git rev-parse --show-toplevel)" --json  # only if missing
+command -v pi gh
+```
+
+The extension follows Orca's CLI selection rules: `ORCA_CLI_COMMAND`, then `orca-dev` for a dev checkout, `orca` inside an Orca-managed Linux terminal, `orca-ide` elsewhere on Linux, and otherwise `orca`.
+
+### Herdr mode
+
+- Herdr `0.8.0` or newer
+- The parent Pi session running inside Herdr (`HERDR_ENV=1`)
+- [`wt`](https://worktrunk.dev) (Worktrunk CLI)
+- The Herdr Pi integration is strongly recommended (`herdr integration install pi`)
+
+Check the setup:
 
 ```bash
 herdr --version
@@ -54,19 +119,31 @@ Or try a checkout for one Pi run:
 pi -e ./extensions/fanout-go-pr-herdr.ts
 ```
 
-Do not enable this package and the tmux-based `pi-parallel-go-pr` package at the same time: they intentionally register the same command and tool names.
+Do not enable this package and another package that registers `fanout-go-pr`, `fanout_go_pr_launch`, or `fanout_go_pr_review_handoff` at the same time unless you intentionally want Pi's suffixed duplicate-command behavior.
 
 ## Usage
 
-From a Pi session running inside Herdr and inside the repository to change:
+Use Orca (default):
 
 ```text
 /fanout-go-pr --base develop --yes Implement the approved plan from docs/plan.md
 ```
 
+Select Herdr explicitly:
+
+```text
+/fanout-go-pr --orchestrator herdr --base develop Implement the approved plan
+```
+
+The short orchestrator flag is also supported:
+
+```text
+/fanout-go-pr -o orca -b release/2026 Ship the release plan
+```
+
 Without `--yes`, Pi presents or clarifies the proposed split before launch. Without plan text, Pi infers the plan from the preceding conversation and asks questions instead of launching if the context is not concrete enough.
 
-Before creating tabs, the extension verifies that the base branch resolves to a commit and that every proposed local fanout branch is available.
+Before creating worktrees, the extension verifies that the base branch resolves to a commit and every proposed local fanout branch is available.
 
 ### Registered surfaces
 
@@ -78,16 +155,12 @@ The tool names are primarily for Pi's model loop; normal usage starts with `/fan
 
 ## Review handoff safety
 
-The review handoff is a terminating Pi tool. It starts a detached shell script that:
+`fanout_go_pr_review_handoff` is terminating and must be the worker's final tool call.
 
-1. targets the worker's exact `HERDR_PANE_ID`;
-2. waits only for Herdr `idle` or `done` (not `blocked`);
-3. sends logical `ctrl+d` to exit the settled worker;
-4. restores the worktree cwd in the pane's shell and waits for an exact, unique readiness marker;
-5. starts a fresh named Pi agent with `herdr agent start`; and
-6. verifies and prompts Pi through the exact pane ID, so a global agent-name collision cannot redirect the review.
+- **Orca:** the detached Node process waits for the worker Pi process to exit, creates a uniquely titled terminal in the same worktree, waits for `tui-idle`, and targets the exact returned terminal handle.
+- **Herdr:** the detached shell process waits only for `idle` or `done`, exits the settled worker, restores the worktree cwd, starts a fresh named Pi agent, and targets the exact Herdr pane ID.
 
-The detached process survives the old Pi process exiting. Its `0600` log is written under the system temporary directory and returned in the handoff tool result. The log is intentionally retained for recovery; remove it after inspection because it can contain local operational metadata. If a handoff fails, inspect that log and recover manually in the same tab:
+The detached process survives the old Pi process exiting. Its `0600` log is written under the system temporary directory and returned in the handoff tool result. The log is intentionally retained for recovery; remove it after inspection because it can contain local operational metadata. If a handoff fails, inspect that log and recover manually in the worker worktree:
 
 ```text
 /pr-review-goal <pr-number> --base=<branch>
@@ -100,16 +173,16 @@ npm install
 npm run check
 ```
 
-The tests cover command parsing, Herdr JSON envelopes and killed outcomes, Worktrunk launch construction, exact-pane handoff generation, shell quoting, worker readiness/worktree verification, and duplicate branch protection.
+The tests cover command parsing and the Orca default, both JSON envelope formats, Orca agent-first arguments, Herdr no-focus dispatch, branch/worktree verification, both detached review scripts, shell safety, and duplicate branch protection.
 
 ## Notes
 
 - Fanout prompt files and review handoff logs use cryptographically unique names in the system temporary directory. Prompt directories use mode `0700`; prompt/log files use `0600` and exclusive creation.
-- Prompt directories are removed after every worker reaches verified readiness. They are retained when dispatch or readiness fails so affected tabs remain diagnosable; remove those directories manually after recovery.
+- Prompt directories are removed after every worker reaches verified readiness. They are retained when dispatch or readiness fails so affected Orca worktrees or Herdr tabs remain diagnosable; remove those directories manually after recovery.
 - Review handoff logs are retained for diagnostics and should be removed after successful handoff or completed recovery.
-- Successfully launched or dispatched tabs are left open on later partial/readiness failure so their agents and terminal output remain inspectable.
-- A tab created for a command that is proven not to have been dispatched is closed by the extension.
-- The extension never closes tabs or workspaces it did not create.
+- Successfully created Orca worktrees or dispatched Herdr tabs are retained on later partial/readiness failure so their state remains inspectable.
+- Herdr tabs proven not to have received a worker command are closed; the extension never closes Herdr tabs or workspaces it did not create.
+- Orca worktrees are never automatically removed after a partial failure.
 
 ## License
 

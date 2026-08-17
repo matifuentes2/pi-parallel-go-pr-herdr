@@ -1,10 +1,11 @@
 {
   "name": "pi-parallel-go-pr-herdr",
   "version": "0.1.0",
-  "description": "Pi extension for fanning out PR-sized work into concurrent Worktrunk worktrees running in Herdr tabs.",
+  "description": "Pi extension for fanning out PR-sized work into concurrent Orca or Herdr worktrees and agents.",
   "keywords": [
     "pi-package",
     "pi",
+    "orca",
     "herdr",
     "worktree",
     "worktrunk",
